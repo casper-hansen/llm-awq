@@ -71,9 +71,9 @@ def stream_output(output_stream):
         print("=" * 50)
         print("Speed of Inference")
         print("-" * 50)
-        # print(f"Context Stage    : {context_time/context_tokens * 1000:.2f} ms/token")
+        print(f"Context Stage    : {context_time/context_tokens * 1000:.2f} ms/token, {1000/(context_time/context_tokens * 1000):.2f} tokens/s")
         print(
-            f"Generation Stage : {np.average(generation_time_list) * 1000:.2f} ms/token"
+            f"Generation Stage : {np.average(generation_time_list) * 1000:.2f} ms/token, {1000/(np.average(generation_time_list) * 1000):.2f} tokens/s"
         )
         # print(f"Average Speed    : {average_speed * 1000:.2f} ms/token")
         print("=" * 50)
@@ -129,9 +129,6 @@ if __name__ == "__main__":
     gen_params.n_vocab = 32000
     tinychat.utils.constants.max_batch_size = args.max_batch_size
     tinychat.utils.constants.max_seq_len = args.max_seq_len
-    # TODO (Haotian): a more elegant implementation here. 
-    # We need to update these global variables before models use them.
-    from tinychat.models import FalconForCausalLM, LlamaForCausalLM, MPTForCausalLM
 
     def skip(*args, **kwargs):
         pass
@@ -142,54 +139,20 @@ if __name__ == "__main__":
     torch.nn.init.normal_ = skip
 
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-    if "mpt" in config.__class__.__name__.lower():
-        # config.init_device="meta"
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.tokenizer_name, trust_remote_code=True
-        )
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(
+    tokenizer = AutoTokenizer.from_pretrained(
             args.model_path, use_fast=False, trust_remote_code=True
         )
     modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    model_type_dict = {
-        "llama": LlamaForCausalLM,
-        "falcon": FalconForCausalLM,
-        "mpt": MPTForCausalLM,
-    }
-
-    if args.precision == "W4A16":
-        if args.model_type.lower() == "llama":
-            model = model_type_dict["llama"](config).half()
-            model = load_awq_llama_fast(
-                model, args.load_quant, 4, args.q_group_size, args.device
-            )
-        else:
-            model = (
-                model_type_dict[args.model_type.lower()](config).half()
-            )
-            model = load_awq_model(
-                model, args.load_quant, 4, args.q_group_size, args.device
-            )
-    else:
-        loaded_model = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            config=config,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        )
-        model = model_type_dict[args.model_type.lower()](config).half().to(args.device)
-        model.load_state_dict(loaded_model.state_dict())
+    model = load_awq_llama_fast(
+        model, args.load_quant, 4, args.q_group_size, args.device
+    )
 
     # device warm up
     device_warmup(args.device)
-    # autotune split_k_iters
-    # tune_all_wqlinears(model)
 
-    # TODO (Haotian): Verify if the StreamGenerator still works for the unmodified falcon impl.
     stream_generator = StreamGenerator
 
     # Optimize AWQ quantized model
@@ -199,24 +162,81 @@ if __name__ == "__main__":
         make_quant_attn(model, args.device)
         make_quant_norm(model)
         make_fused_mlp(model)
-    model_prompter = get_prompter(args.model_type, args.model_path)
-    stop_token_ids = get_stop_token_ids(args.model_type, args.model_path)
-    count = 0
-    while True:
-        # Get input from the user
-        input_prompt = input("USER: ")
-        if input_prompt == "":
-            print("EXIT...")
-            break
-        model_prompter.insert_prompt(input_prompt)
-        output_stream = stream_generator(
-            model,
-            tokenizer,
-            model_prompter.model_input,
-            gen_params,
-            device=args.device,
-            stop_token_ids=stop_token_ids,
-        )
-        outputs = stream_output(output_stream)
-        model_prompter.update_template(outputs)
-        count += 1
+    
+    @torch.inference_mode()
+    def new():
+        def _timer(func):
+            start = time.time()
+            out = func()
+            return out, time.time() - start
+
+        def _generate(model, model_out, n_generate, batch_size):
+            past_key_values = model_out.past_key_values
+
+            for i in range(n_generate):
+                logits = model_out.logits[:, -1, :]
+                new_tokens = []
+
+                for batch_index in range(batch_size):
+                    probs = torch.softmax(logits[batch_index], dim=-1)
+                    token = torch.multinomial(probs, num_samples=1)
+                    new_tokens.append(token)
+                
+                tokens = torch.as_tensor(new_tokens, device=args.device).unsqueeze(-1)
+
+                model_out = model(tokens, use_cache=True, past_key_values=past_key_values)
+
+        def _warmup(device:str):
+            warm_up = torch.randn((4096,4096)).to(device)
+            torch.mm(warm_up,warm_up)
+        
+        n_generate = 128
+        n_context = 256
+        batch_size = 1
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        _warmup(args.device)
+
+        # Generate random inputs
+        n_context = n_context - n_generate
+        ids = torch.randint(0, tokenizer.vocab_size, (batch_size, n_context)).cuda()
+
+        # Context stage
+        model_out, context_time = _timer(lambda: model(ids, use_cache=True))
+
+        # Generation stage
+        _, generation_time = _timer(lambda: _generate(model, model_out, n_generate, batch_size))
+
+        # Prints
+        memory_used = torch.cuda.max_memory_allocated(args.device) / (1024 ** 2)
+        context_tokens_per_second = n_context / context_time * batch_size
+        context_ms_per_token = (context_time*1000) / n_context / batch_size
+        inference_tokens_per_second = n_generate / generation_time * batch_size
+        inference_ms_per_token = (generation_time*1000) / n_generate / batch_size
+
+        print(f"[======] Model summary: {args.model_path} [======]")
+        print(f"[*] Context speed: {context_tokens_per_second:.2f} tokens/second ({context_ms_per_token:.2f} ms/token)")
+        print(f"[*] Generation speed: {inference_tokens_per_second:.2f} tokens/second ({inference_ms_per_token:.2f} ms/token)")
+        print(f"[*] VRAM: {memory_used:.2f} MB")
+
+    def old():
+        model_prompter = get_prompter(args.model_type, args.model_path)
+        stop_token_ids = get_stop_token_ids(args.model_type, args.model_path)
+        count = 0
+        while True:
+            # Get input from the user
+            input_prompt = "Tell me about the flying blue wolf"
+            model_prompter.insert_prompt(input_prompt)
+            output_stream = stream_generator(
+                model,
+                tokenizer,
+                model_prompter.model_input,
+                gen_params,
+                device=args.device,
+                stop_token_ids=stop_token_ids,
+            )
+            outputs = stream_output(output_stream)
+            model_prompter.update_template(outputs)
+            count += 1
+    
+    new()

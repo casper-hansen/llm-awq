@@ -88,9 +88,9 @@ def StreamGenerator(
                 logits = out.logits
                 past_key_values = out.past_key_values
         else:
-            out = model(inputs, start_pos=start_pos)
-            start_pos += out.shape[1]
-            logits = out
+            out = model(inputs, use_cache=True)
+            start_pos += out[0].shape[1]
+            logits = out[0]
         torch.cuda.synchronize()
         t_ed = time.time()
 
