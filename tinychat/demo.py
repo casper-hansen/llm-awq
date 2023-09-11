@@ -150,12 +150,14 @@ if __name__ == "__main__":
     #     model, args.load_quant, 4, args.q_group_size, args.device
     # )
 
-    from tinychat.models.mpt import MPTForCausalLM
+    # from tinychat.models.mpt import MPTForCausalLM
 
-    model = MPTForCausalLM(config).half()
+    # model = MPTForCausalLM(config).half()
     model = load_awq_model(
         model, args.load_quant, 4, args.q_group_size, args.device
     )
+
+    print(model)
 
     # device warm up
     device_warmup(args.device)
@@ -170,9 +172,9 @@ if __name__ == "__main__":
         make_quant_norm(model)
         make_fused_mlp(model)
 
-    # elif args.precision == "W4A16" and args.model_type.lower() == "mpt":
-    #     from tinychat.modules import make_quant_attn_mpt
-    #     make_quant_attn_mpt(model, args.device)
+    elif args.precision == "W4A16" and args.model_type.lower() == "mpt":
+        from tinychat.modules.fused_mpt import fuse_block
+        fuse_block(model)
     
     @torch.inference_mode()
     def new():
@@ -234,20 +236,20 @@ if __name__ == "__main__":
         model_prompter = get_prompter(args.model_type, args.model_path)
         stop_token_ids = get_stop_token_ids(args.model_type, args.model_path)
         count = 0
-        while True:
-            # Get input from the user
-            input_prompt = "Tell me about the flying blue wolf"
-            model_prompter.insert_prompt(input_prompt)
-            output_stream = stream_generator(
-                model,
-                tokenizer,
-                model_prompter.model_input,
-                gen_params,
-                device=args.device,
-                stop_token_ids=stop_token_ids,
-            )
-            outputs = stream_output(output_stream)
-            model_prompter.update_template(outputs)
-            count += 1
-    
+
+        # Get input from the user
+        input_prompt = "Tell me about the flying blue wolf"
+        model_prompter.insert_prompt(input_prompt)
+        output_stream = stream_generator(
+            model,
+            tokenizer,
+            model_prompter.model_input,
+            gen_params,
+            device=args.device,
+            stop_token_ids=stop_token_ids,
+        )
+        outputs = stream_output(output_stream)
+        model_prompter.update_template(outputs)
+        count += 1
+
     old()
