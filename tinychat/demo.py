@@ -171,8 +171,8 @@ if __name__ == "__main__":
 
     elif args.precision == "W4A16" and args.model_type.lower() == "mpt":
         from tinychat.modules.fused_mpt import fuse_block, fuse_transformer
-        fuse_block(model)
-        # fuse_transformer(model)
+        # fuse_block(model)
+        fuse_transformer(model)
     
     @torch.inference_mode()
     def new():

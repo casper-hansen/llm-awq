@@ -1,17 +1,8 @@
-import math
 import torch
 from torch import nn
-from torch.nn import functional as F
-import awq_inference_engine
 from tinychat.modules.attn import QuantAttentionFused
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.mpt.modeling_mpt import MptBlock as OldMptBlock, MptForCausalLM
-
-class SharedEmbedding(nn.Embedding):
-    def forward(self, input: torch.Tensor, unembed: bool = False) -> torch.Tensor:
-        if unembed:
-            return F.linear(input, self.weight)
-        return super().forward(input)
 
 class MPTBlock(nn.Module):
     def __init__(self, hidden_size, n_heads, qkv_layer, o_proj, mpt_mlp, norm_1, norm_2):
@@ -41,28 +32,12 @@ class MPTBlock(nn.Module):
         return out, None, past_key_value
 
 class MPTModel(nn.Module):
-    def __init__(self, vocab_size, n_layers, d_model, n_heads, blocks, dev):
+    def __init__(self, vocab_size, blocks, wte, norm_f):
         super().__init__()
         self.vocab_size = vocab_size
-        self.n_layers = n_layers
-
-        self.wte = SharedEmbedding(vocab_size, d_model).to(dev)
-
-        self.blocks: list[MPTBlock] = torch.nn.ModuleList()
-
-        module: OldMptBlock
-        for module in blocks:
-            self.blocks.append(
-                MPTBlock(
-                    d_model,
-                    n_heads,
-                    module.attn.Wqkv,
-                    module.attn.out_proj,
-                    module.ffn
-                ).to(dev)
-            )
-
-        self.norm_f = nn.LayerNorm(d_model, eps=1e-5).to(dev)
+        self.wte = wte
+        self.blocks: list[MPTBlock] = torch.nn.ModuleList(blocks)
+        self.norm_f = norm_f
 
     @torch.inference_mode()
     def forward(self, input_ids, attn_bias=None, attention_mask=None, is_causal=None, *args, **kwargs):
@@ -77,25 +52,10 @@ class MPTModel(nn.Module):
             mask = torch.triu(mask, diagonal=self.blocks[0].attn.start_pos + 1).type_as(h)
 
         for layer in self.blocks:
-            h, mask, past_key_value = layer(h, None, attention_mask=mask, is_causal=is_causal)
+            h, _, past_key_value = layer(h, None, attention_mask=mask, is_causal=is_causal)
         h = self.norm_f(h)
 
         return BaseModelOutputWithPast(last_hidden_state=h, past_key_values=past_key_value, hidden_states=(), attentions=())
-
-class MPTForCausalLM(nn.Module):
-    def __init__(self, vocab_size, n_layers, d_model, n_heads, blocks, dev):
-        super().__init__()
-        self.transformer = MPTModel(vocab_size, n_layers, d_model, n_heads, blocks, dev)
-
-        for module in self.modules():
-            if hasattr(module, "bias") and isinstance(module.bias, nn.Parameter):
-                module.register_parameter("bias", None)
-
-    @torch.inference_mode()
-    def forward(self, input_ids, attn_bias=None, attention_mask=None, is_causal=None, *args, **kwargs):
-        h = self.transformer(input_ids, attn_bias=attn_bias, attention_mask=attention_mask, is_causal=is_causal)
-        output = self.transformer.wte(h, unembed=True)
-        return output.float()
 
 def set_module_name(model, name, value):
     if '.' in name:
@@ -127,11 +87,23 @@ def fuse_block(model: MptForCausalLM):
             set_module_name(model, name, block)
 
 def fuse_transformer(model: MptForCausalLM):
+    module: OldMptBlock
+    blocks = []
+
+    for module in model.transformer.blocks:
+        blocks.append(MPTBlock(
+            model.config.d_model,
+            model.config.n_heads,
+            module.attn.Wqkv,
+            module.attn.out_proj,
+            module.ffn,
+            module.norm_1,
+            module.norm_2
+        ))
+
     model.transformer = MPTModel(
         model.config.vocab_size,
-        model.config.n_layers,
-        model.config.d_model,
-        model.config.n_heads,
-        model.transformer.blocks,
-        next(iter(model.state_dict().values())).device
+        blocks,
+        model.transformer.wte,
+        model.transformer.norm_f,
     )
