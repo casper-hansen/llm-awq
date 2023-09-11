@@ -85,12 +85,12 @@ def stream_output(output_stream):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--model_type", type=str, default="LLaMa", help="type of the model"
+        "--model_type", type=str, default="mpt", help="type of the model"
     )
     parser.add_argument(
         "--model_path",
         type=str,
-        default="/data/llm/checkpoints/vicuna-hf/vicuna-7b",
+        default="mpt-7b-8k-chat-awq-gemv",
         help="path to the model",
     )
     parser.add_argument(
@@ -101,7 +101,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--load_quant",
         type=str,
-        default="/data/llm/checkpoints/vicuna-hf/vicuna-7b-awq-w4g128.pt",
+        default="mpt-7b-8k-chat-awq-gemv/awq_model_w4_g128.pt",
         help="path to the pre-quanted 4-bit weights",
     )
     parser.add_argument(
@@ -140,13 +140,20 @@ if __name__ == "__main__":
 
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(
-            args.model_path, use_fast=False, trust_remote_code=True
+            args.model_path, use_fast=True, trust_remote_code=True
         )
     modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
-    model = load_awq_llama_fast(
+    # model = load_awq_llama_fast(
+    #     model, args.load_quant, 4, args.q_group_size, args.device
+    # )
+
+    from tinychat.models.mpt import MPTForCausalLM
+
+    model = MPTForCausalLM(config).half()
+    model = load_awq_model(
         model, args.load_quant, 4, args.q_group_size, args.device
     )
 
@@ -162,6 +169,10 @@ if __name__ == "__main__":
         make_quant_attn(model, args.device)
         make_quant_norm(model)
         make_fused_mlp(model)
+
+    # elif args.precision == "W4A16" and args.model_type.lower() == "mpt":
+    #     from tinychat.modules import make_quant_attn_mpt
+    #     make_quant_attn_mpt(model, args.device)
     
     @torch.inference_mode()
     def new():
@@ -239,4 +250,4 @@ if __name__ == "__main__":
             model_prompter.update_template(outputs)
             count += 1
     
-    new()
+    old()
