@@ -151,13 +151,10 @@ if __name__ == "__main__":
     # )
 
     # from tinychat.models.mpt import MPTForCausalLM
-
     # model = MPTForCausalLM(config).half()
     model = load_awq_model(
         model, args.load_quant, 4, args.q_group_size, args.device
     )
-
-    print(model)
 
     # device warm up
     device_warmup(args.device)
@@ -173,8 +170,9 @@ if __name__ == "__main__":
         make_fused_mlp(model)
 
     elif args.precision == "W4A16" and args.model_type.lower() == "mpt":
-        from tinychat.modules.fused_mpt import fuse_block
+        from tinychat.modules.fused_mpt import fuse_block, fuse_transformer
         fuse_block(model)
+        # fuse_transformer(model)
     
     @torch.inference_mode()
     def new():
