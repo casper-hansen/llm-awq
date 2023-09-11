@@ -4,6 +4,37 @@ from torch import nn
 from torch.nn import functional as F
 import awq_inference_engine
 
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+):
+    xq_ = torch.view_as_complex(
+        xq.float().reshape(*xq.shape[:-1], 2, -1).transpose(-2, -1).contiguous()
+    )
+    xk_ = torch.view_as_complex(
+        xk.float().reshape(*xk.shape[:-1], 2, -1).transpose(-2, -1).contiguous()
+    )
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).transpose(-2, -1).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).transpose(-2, -1).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
 def set_module_name(model, name, value):
     if '.' in name:
         parent_name = name.rsplit('.', 1)[0]
@@ -75,10 +106,15 @@ class QuantAttentionFused(nn.Module):
             self.rotary_dim = 0
             self.is_neox = False
         else:
-            pass
+            self.freqs_cis = precompute_freqs_cis(
+                hidden_size // num_heads,
+                max_seq_len * 2,
+            ).to(dev)
+            self.rotary_dim = self.head_dim
+            self.alibi_slopes = None
+            self.is_neox = True
     
     def _multi_query_attention_torch(self, query, key, value, batch_size, seqlen, use_cache, past_key_value, attention_mask):
-        # faster prompt processing
         query = query.view(batch_size, seqlen, self.n_local_heads, self.head_dim).transpose(1, 2)
         key = key.view(batch_size, seqlen, self.n_local_heads, self.head_dim).transpose(1, 2)
         value = value.view(batch_size, seqlen, self.n_local_heads, self.head_dim).transpose(1, 2)
@@ -113,7 +149,7 @@ class QuantAttentionFused(nn.Module):
             xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
             if not self.use_alibi:
-                pass
+                xq, xk = apply_rotary_emb(xq, xk, freqs_cis=self.freqs_cis[self.start_pos : self.start_pos + seqlen])
 
             self.cache_k = self.cache_k.to(xq)
             self.cache_v = self.cache_v.to(xq)
@@ -165,11 +201,11 @@ class MptBlock(nn.Module):
     def __init__(self, hidden_size, n_heads, qkv_layer: WQLinear, o_proj: WQLinear, mpt_mlp):
         super().__init__()
         self.n_heads = n_heads
-        self.dim = hidden_size
-        self.attn = QuantAttentionFused(self.dim, self.n_heads, qkv_layer, o_proj, dev="cuda:0", max_seq_len=8096, use_alibi=True).to("cuda:0")
+        self.hidden_size = hidden_size
+        self.attn = QuantAttentionFused(hidden_size, self.n_heads, qkv_layer, o_proj, dev="cuda:0", max_seq_len=8096, use_alibi=True).to("cuda:0")
         self.ffn = mpt_mlp.to("cuda:0")
-        self.norm_1 = nn.LayerNorm(self.dim, eps=1e-6).to("cuda:0")
-        self.norm_2 = nn.LayerNorm(self.dim, eps=1e-6).to("cuda:0")
+        self.norm_1 = nn.LayerNorm(hidden_size, eps=1e-6).to("cuda:0")
+        self.norm_2 = nn.LayerNorm(hidden_size, eps=1e-6).to("cuda:0")
 
     def forward(
         self, hidden_states, past_key_value, attn_bias, attention_mask, is_causal
