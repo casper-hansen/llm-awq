@@ -36,6 +36,10 @@ It also offers a turn-key solution for **on-device inference** of LLMs on **reso
 
 ## Install
 
+```
+pip install -e . && cd awq/kernels && python setup.py install && cd csrc/attention && python setup.py install && cd ../../../..
+```
+
 1. Clone this repository and navigate to AWQ folder
 ```
 git clone https://github.com/mit-han-lab/llm-awq
